@@ -219,11 +219,13 @@ class PaxosBasic (object):
             data.accepted_seq = seq_id
         self.master_id = self.get_server_id_from_seq (seq_id)
         if self.master_id == self.server_id:
+            self.is_master = True
             if is_new:
                 self.log_info ("i am now leader")
                 for server_id in self.all_peers:
                     self.send_msg (server_id, PaxosType.ACCEPTED, inst, seq_id, val)
         else:
+            self.is_master = False
             self.log_info ("server %s is master, inst %s val %s seq %s" % (self.master_id, inst, seq_id, val))
 
     def _on_nack (self, remote_id, inst, seq_id, val):
