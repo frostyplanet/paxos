@@ -1,5 +1,10 @@
 *.py[cod]
 
+private/
+log/
+tags
+*.sw*
+
 # C extensions
 *.so
 
