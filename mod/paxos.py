@@ -3,11 +3,35 @@
 
 import _env
 from lib.enum import Enum
-from mod.packet import PaxosMsg
+from mod.packet import DownStreamPacket, PacketBase
 
-PaxosRole = Enum (PROPOSER=1, ACCEPTOR=2, LEARNER=3)
 PaxosType = Enum (PREPARE=1, PROMISE=2, PROPOSE=3, ACCEPTED=4, NACK=5)
 
+class PaxosMsg (DownStreamPacket):
+
+    attrs = ["paxos_type", "inst", "seq_id", "val"]
+    check_attrs = ["paxos_type", "inst"]
+
+    @classmethod
+    def make (cls, server_id, paxos_type, instance, seq_id, val=None):
+        self = cls ()
+        self.init (server_id)
+        self.data['paxos_type'] = paxos_type
+        self.data['inst'] = instance
+        self.data['seq_id'] = seq_id
+        self.data['val'] = val
+        return self
+
+    def __str__ (self):
+        msg = "%s[server_id:%s,%s]" % (self.meta_data["type"], self.meta_data["server_id"],
+                self.get_time ())
+        msg += " %s inst %s, seq_id %s, val %s" % (
+                PaxosType._get_name (self['paxos_type']), 
+                self['inst'], self['seq_id'], self['val'],
+                )
+        return msg
+
+PacketBase.register(PaxosMsg)
 
 class Instance (object):
 
@@ -42,8 +66,20 @@ class Instance (object):
                 self.propose_seq = seq_id
                 return seq_id
 
+    def __str__ (self, is_proposer=True, is_acceptor=True, is_learner=True):
+        msg = "[%s] accepted_val:%s accepted_seq:%s" % (self.inst_id, self.accepted_val, self.accepted_seq)
+        if is_proposer:
+            msg += " propose_seq:%s propose_val:%s highest_accepted_seq:%s highest_accepted_val:%s quorum:%s" % (
+                    self.propose_seq, self.propose_val, self.highest_accepted_seq, self.highest_accepted_val, self.quorum,
+                    )
+        if is_acceptor:
+            msg += " promised_seq:%s" % (
+                 self.promised_seq,    
+                    )
+        return msg
 
-class Paxos (object):
+
+class PaxosBasic (object):
 
     def __init__ (self, server_id, logger):
         self.logger = logger 
@@ -74,6 +110,8 @@ class Paxos (object):
     def get_server_id_from_seq (self, seq):
         return seq % self.server_numbers
         
+    def run (self):
+        pass
 
     def log_error (self, msg):
         self.logger.error ("server %s: %s" % (self.server_id, msg))
@@ -85,24 +123,30 @@ class Paxos (object):
         self.proposer_ids = set(proposer_ids)
         self.acceptor_ids = set(acceptor_ids)
         self.learner_ids = set(learner_ids)
-        self.all_peers = self.proposer_ids + self.acceptor_ids + self.learner_ids
+        self.all_peers = set.union (self.proposer_ids, self.acceptor_ids, self.learner_ids)
         self.all_peers.remove (self.server_id)
         if self.server_id in self.proposer_ids:
             self.is_proposer = True
+        else:
+            self.is_proposer = False
         if self.server_id in self.acceptor_ids:
             self.is_acceptor = True
+        else:
+            self.is_acceptor = False
         if self.server_id in self.learner_ids:
             self.is_learner = True
+        else:
+            self.is_learner = False
 
-    def _on_msg_send (self, remote_id, msg):
+    def _on_msg_to_send (self, remote_id, msg):
         raise NotImplementedError ()
 
     def _on_msg_recv (self, msg):
-        remote_id = msg.data['server_id']
-        paxos_type = msg.data['paxos_type']
-        inst = msg.data['inst']
-        seq_id = msg.data['seq_id']
-        val = msg.data['val']
+        remote_id = msg['server_id']
+        paxos_type = msg['paxos_type']
+        inst = msg['inst']
+        seq_id = msg['seq_id']
+        val = msg['val']
         if inst > self.max_inst:
             self.max_inst = inst
         if paxos_type == PaxosType.PREPARE:
@@ -165,31 +209,38 @@ class Paxos (object):
 
 
     def _on_accepted (self, remote_id, inst, seq_id, val):
+        is_new = False
         data = self.instance_get_create(inst)
         data.accepted_val = val
-        data.accepted_seq = seq_id
-        if self.get_server_id_from_seq (seq_id) == self.server_id:
+        if data.accepted_seq != seq_id:
+            is_new = True
+            data.accepted_seq = seq_id
+        self.master_id = self.get_server_id_from_seq (seq_id)
+        if self.master_id == self.server_id and is_new:
             self.log_info ("i am now leader")
             for server_id in self.all_peers:
                 self.send_msg (server_id, PaxosType.ACCEPTED, inst, seq_id, val)
+        else:
+            self.log_info ("server %s is master, inst %s val %s seq %s" % (self.master_id, inst, seq_id, val))
 
     def _on_nack (self, remote_id, inst, seq_id, val):
         if not self.is_proposer:
             self.log_error ("not proposer, ignore nak from %s" % (remote_id))
             return
         #TODO what to do with val
-        self.start_paxos (inst, seq_id)
+        self.start_paxos (inst, knowned_seq=seq_id)
 
 
     def send_msg (self, remote_id, paxos_type, inst, seq_id, val=None):
         msg = PaxosMsg.make (self.server_id, paxos_type, inst, seq_id, val)
-        self._on_msg_send (remote_id, msg)
+        self._on_msg_to_send (remote_id, msg)
 
-    def start_paxos (self, inst, knowned_seq=0):
+    def start_paxos (self, inst, val=None, knowned_seq=0):
         if not self.is_proposer:
             self.log_error ("not proposer, cannot start paxos")
             return
         data = self.instance_get_create (inst)
+        data.propose_val = val
         data.increase_seq (self.server_id, self.server_numbers, knowned_seq)
         for server_id in self.acceptor_ids:
             self.send_msg (server_id, PaxosType.PREPARE, inst, data.propose_seq, data.accepted_val)

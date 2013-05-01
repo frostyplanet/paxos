@@ -123,21 +123,6 @@ class DirectPacket (PacketBase):
 
 #####################################################
 
-class PaxosMsg (DownStreamPacket):
-
-    attrs = ["paxos_type", "inst", "seq_id", "val"]
-    check_attrs = ["paxos_type", "inst"]
-
-    @classmethod
-    def make (cls, server_id, paxos_type, instance, seq_id, val=None):
-        self = cls ()
-        self.init (server_id)
-        self.data['paxos_type'] = paxos_type
-        self.data['inst'] = instance
-        self.data['seq_id'] = seq_id
-        self.data['val'] = val
-        return self
-
 
 class StatusReq (DirectPacket):
 
@@ -195,9 +180,10 @@ class ControlResp (DirectPacket):
 
 #################################################
 
+
 for _obj in globals().values():
     if 'make' in dir (_obj) and issubclass(_obj, PacketBase):
         PacketBase.register (_obj)
-         
+
         
 # vim: tabstop=4 expandtab shiftwidth=4 softtabstop=4 :
