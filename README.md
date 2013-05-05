@@ -14,4 +14,5 @@ TODO
 
 * failure test
 * network c/s integration
+* group membership intergration in paxos
 * Multi Paxos
