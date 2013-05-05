@@ -1,6 +1,9 @@
 #!/usr/bin/env python
 # coding:utf-8
 
+# @file socket_egine.py 
+# @author frostyplanet@gmail.com
+
 import _env
 from lib.enum import Enum
 from mod.packet import DownStreamPacket, PacketBase
@@ -113,6 +116,7 @@ class PaxosBasic (object):
         self.proposer_ids = set ()
         self.acceptor_ids = set ()
         self.learner_ids = set ()
+        self.quorum_ids = set ()
         self.all_peers = set ()
 
     @property
@@ -252,13 +256,11 @@ class PaxosBasic (object):
 
     def _on_accepted (self, remote_id, inst, seq_id, val):
         """ assume that every paxos run will increase seq_id """
-        is_new = False
         data = self.instance_get_create(inst)
         data.accepted_val = val
         if data.accepted_seq < seq_id:
-            is_new = True
             data.accepted_seq = seq_id
-        if not is_new:
+        else:
             return
         self.master_id = self.get_server_id_from_seq (seq_id)
         if self.is_proposer:
