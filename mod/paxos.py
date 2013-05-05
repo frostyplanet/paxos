@@ -4,8 +4,10 @@
 import _env
 from lib.enum import Enum
 from mod.packet import DownStreamPacket, PacketBase
+import time
 
 PaxosType = Enum (PREPARE=1, PROMISE=2, PROPOSE=3, ACCEPTED=4, NACK=5)
+PaxosProposerState = Enum (NEW=0, PREPARE=1, PROPOSE=3, ACCEPTED=4)
 
 class PaxosMsg (DownStreamPacket):
 
@@ -35,24 +37,39 @@ PacketBase.register(PaxosMsg)
 
 class Instance (object):
 
-    def __init__ (self, inst_id):
+    def __init__ (self, inst_id, logger):
         self.inst_id = inst_id
         self.promised_seq = None
         self.accepted_val = None
         self.accepted_seq = None
+        self.logger = logger
+        self.error = 0
 
         # for proposer
         self.propose_seq = None
         self.propose_val = None
-        self.propose_sent = False
+        self.propose_state = PaxosProposerState.NEW
+        self.propose_last_ts = time.time ()
+        self.start_ts = 0
+        self.paxos_time = 0  # only calculate on the one become master
+        self.retry = False
         self.quorum = set ()
         self.highest_accepted_seq = None
         self.highest_accepted_val = None
 
     def add_promise (self, remote_id, promised_seq, accepted_val):
-        if self.accepted_val is None or self.highest_accepted_seq < promised_seq:
-            self.highest_accepted_val = accepted_val
-            self.highest_accepted_seq = promised_seq
+        if accepted_val is not None:
+            if self.accepted_val is not None and self.accepted_val != accepted_val:
+                self.logger.error ("conflict detected: inst %s %s(seq %s) != %s(seq %s)" % (
+                    self.inst_id, self.accepted_val, self.highest_accepted_seq,
+                    accepted_val, promised_seq))
+                self.error += 1
+            if promised_seq > self.propose_seq:
+                self.logger.error ("error detected: promised_seq %s > propose_seq %s" % (promised_seq, self.propose_seq))
+                self.error += 1
+            if self.accepted_val is None or self.highest_accepted_seq < promised_seq:
+                self.highest_accepted_val = accepted_val
+                self.highest_accepted_seq = promised_seq
         self.quorum.add (remote_id)
 
     def increase_seq (self, server_id, n, max_seq=0):
@@ -70,12 +87,13 @@ class Instance (object):
     def __str__ (self, is_proposer=True, is_acceptor=True, is_learner=True):
         msg = "[%s] accepted_val:%s accepted_seq:%s" % (self.inst_id, self.accepted_val, self.accepted_seq)
         if is_proposer:
-            msg += " propose_seq:%s propose_val:%s highest_accepted_seq:%s highest_accepted_val:%s quorum:%s" % (
+            msg += " propose_seq:%s propose_val:%s highest_accepted_seq:%s highest_accepted_val:%s quorum:%s paxos_time:%s, start_time:%s" % (
                     self.propose_seq, self.propose_val, self.highest_accepted_seq, self.highest_accepted_val, self.quorum,
+                    self.paxos_time, self.start_time
                     )
         if is_acceptor:
             msg += " promised_seq:%s" % (
-                 self.promised_seq,    
+                 self.promised_seq, 
                     )
         return msg
 
@@ -104,15 +122,21 @@ class PaxosBasic (object):
     def instance_get_create (self, inst_id):
         i = self.state.get (inst_id)
         if not i:
-            self.state[inst_id] = Instance (inst_id)
+            self.state[inst_id] = Instance (inst_id, self.logger)
             i = self.state[inst_id]
         return i
 
     def get_server_id_from_seq (self, seq):
         return seq % self.server_numbers
         
-    def run (self):
-        pass
+    def check_timeout (self, inst, timeout):
+        if not self.is_proposer:
+            return
+        data = self.instance_get_create (inst)
+        if data.start_ts and data.propose_state != PaxosProposerState.ACCEPTED and \
+                time.time () - data.start_ts > timeout:
+            self.start_paxos (inst)
+
 
     def log_error (self, msg):
         self.logger.error ("server %s: %s" % (self.server_id, msg))
@@ -138,6 +162,10 @@ class PaxosBasic (object):
             self.is_learner = True
         else:
             self.is_learner = False
+        if self.is_proposer:
+            self.quorum_ids = set(self.acceptor_ids)
+            if self.is_acceptor:
+                self.quorum_ids.remove (self.server_id)
 
     def _on_msg_to_send (self, remote_id, msg):
         raise NotImplementedError ()
@@ -183,16 +211,18 @@ class PaxosBasic (object):
             return
         data = self.instance_get_create (inst)
         data.add_promise (remote_id, seq_id, val)
-        if len (data.quorum) > len(self.acceptor_ids) / 2.0 and not data.propose_sent:
+        if len (data.quorum) > len(self.acceptor_ids) / 2.0 and data.propose_state == PaxosProposerState.PREPARE:
             # decide value and send propose 
-            data.propose_sent = True
+            data.propose_state = PaxosProposerState.PROPOSE
+            data.propose_last_ts = time.time ()
             seq_id = data.propose_seq
             val = None
             if data.highest_accepted_val is not None:
+                #TODO conflict detection, we now just believe everything decided will not change by replica
                 val = data.accepted_val = data.highest_accepted_val
             else:
                 val = data.propose_val
-            for server_id in self.acceptor_ids:
+            for server_id in self.quorum_ids:
                 self.send_msg (server_id, PaxosType.PROPOSE, inst, seq_id, val)
 
 
@@ -208,56 +238,87 @@ class PaxosBasic (object):
         data.accepted_seq = seq_id
         data.accepted_val = val
         self.send_msg (remote_id, PaxosType.ACCEPTED, inst, seq_id, val)
+        self.master_id = self.get_server_id_from_seq (seq_id)
+        self._notify_accepted (inst, val)
 
+    def accepted_callback (self, inst, val):
+        raise NotImplementedError ()
+
+    def _notify_accepted (self, inst, val):
+        try:
+            self.accepted_callback (inst, val)
+        except NotImplementedError:
+            pass
 
     def _on_accepted (self, remote_id, inst, seq_id, val):
+        """ assume that every paxos run will increase seq_id """
         is_new = False
         data = self.instance_get_create(inst)
         data.accepted_val = val
-        if data.accepted_seq != seq_id:
+        if data.accepted_seq < seq_id:
             is_new = True
             data.accepted_seq = seq_id
+        if not is_new:
+            return
         self.master_id = self.get_server_id_from_seq (seq_id)
-        if self.master_id == self.server_id:
-            self.is_master = True
-            if is_new:
-                self.log_info ("i am now leader")
-                for server_id in self.all_peers:
-                    self.send_msg (server_id, PaxosType.ACCEPTED, inst, seq_id, val)
+        if self.is_proposer:
+            if self.master_id == self.server_id:
+                self.is_master = True
+            else:
+                self.is_master = False
+            if data.start_ts:
+                data.paxos_time = time.time () - data.start_ts
+            data.propose_state = PaxosProposerState.ACCEPTED
+        if self.is_master:
+            self.log_info ("i am now leader, broadcasting message")
+            for server_id in self.all_peers:
+                self.send_msg (server_id, PaxosType.ACCEPTED, inst, seq_id, val)
         else:
-            self.is_master = False
             self.log_info ("server %s is master, inst %s val %s seq %s" % (self.master_id, inst, seq_id, val))
+        self._notify_accepted (inst, val)
+
 
     def _on_nack (self, remote_id, inst, seq_id, val):
         if not self.is_proposer:
-            self.log_error ("not proposer, ignore nak from %s" % (remote_id))
+            self.log_error ("not proposer, ignore nack from %s" % (remote_id))
             return
         #TODO what to do with val
         data = self.instance_get_create (inst)
-        if seq_id > data.propose_seq: # else is old nak that can ignore
-            self.start_paxos (inst, knowned_seq=seq_id)
+        if val is not None:
+            data.accepted_val = val
+            data.accepted_seq = seq_id
+            data.paxos_time = time.time () - data.start_ts
+            data.propose_state = PaxosProposerState.ACCEPTED
+            self._notify_accepted (inst, val)
+        if (val is None or data.retry) and seq_id > data.propose_seq: # old nack will ignore
+            self.start_paxos (inst, knowned_seq=seq_id, retry=data.retry)
 
 
     def send_msg (self, remote_id, paxos_type, inst, seq_id, val=None):
         msg = PaxosMsg.make (self.server_id, paxos_type, inst, seq_id, val)
         self._on_msg_to_send (remote_id, msg)
 
-    def start_paxos (self, inst, val=None, knowned_seq=0):
+    def start_paxos (self, inst, val=None, knowned_seq=0, retry=False):
+        """ if retry is True, the proposer will always try to become leader """
         if not self.is_proposer:
             self.log_error ("not proposer, cannot start paxos")
             return
         data = self.instance_get_create (inst)
+        data.retry = retry
         data.propose_sent = False
-        data.propose_val = val
+        if val is not None:
+            data.propose_val = val
+        elif data.propose_val is None:
+            raise Exception ("must define a value to propose")
         data.increase_seq (self.server_id, self.server_numbers, knowned_seq)
-        for server_id in self.acceptor_ids:
+        data.propose_state = PaxosProposerState.PREPARE
+        data.start_ts = data.propose_last_ts = time.time ()
+        for server_id in self.quorum_ids:
             self.send_msg (server_id, PaxosType.PREPARE, inst, data.propose_seq, data.accepted_val)
 
-        
-        
 
 def test ():
-    data = Instance (0)
+    data = Instance (0, None)
     print data.increase_seq(0, 3), data.propose_seq
     print data.increase_seq(0, 3), data.propose_seq
     print data.increase_seq(9, 3), data.propose_seq

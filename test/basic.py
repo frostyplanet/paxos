@@ -47,6 +47,7 @@ class TestPaxosBasic (unittest.TestCase):
             self.logger.info ("________%s__instance %s_________" % (server.server_id, i))
             data = server.instance_get_create (i)
             self.logger.info (data.__str__ (server.is_proposer, server.is_acceptor, server.is_learner))
+            self.assertEqual (data.error, 0)
 
     def setUp (self):
         self.paxos = dict ()
