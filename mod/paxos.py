@@ -291,6 +291,7 @@ class PaxosBasic (object):
             data.accepted_seq = seq_id
             data.paxos_time = time.time () - data.start_ts
             data.propose_state = PaxosProposerState.ACCEPTED
+            self.master_id = self.get_server_id_from_seq (seq_id)
             self._notify_accepted (inst, val)
         if (val is None or data.retry) and seq_id > data.propose_seq: # old nack will ignore
             self.start_paxos (inst, knowned_seq=seq_id, retry=data.retry)
